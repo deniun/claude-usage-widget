@@ -53,6 +53,7 @@ export default function App() {
   const [titleBarVisible, setTitleBarVisible] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const hideGuardUntilRef = useRef(0);
+  const titleBarVisibleRef = useRef(false);
   const lastAppliedSizeRef = useRef<{ w: number; h: number } | null>(null);
 
   useEffect(() => {
@@ -63,6 +64,7 @@ export default function App() {
       const dragRegion = target.closest("[data-window-drag-region='true']");
       if (!dragRegion || target.closest("button")) return;
       hideGuardUntilRef.current = Date.now() + 400;
+      titleBarVisibleRef.current = true;
       setTitleBarVisible(true);
     };
 
@@ -95,6 +97,11 @@ export default function App() {
       }
     };
 
+    const show = (v: boolean) => {
+      titleBarVisibleRef.current = v;
+      setTitleBarVisible((prev) => (prev === v ? prev : v));
+    };
+
     const syncTitleBarVisibility = async () => {
       if (pollInFlight) return;
       pollInFlight = true;
@@ -113,26 +120,59 @@ export default function App() {
           menuOpen ||
           hovered ||
           Date.now() < hideGuardUntilRef.current;
-        setTitleBarVisible((prev) => (prev === shouldShow ? prev : shouldShow));
+        show(shouldShow);
       } catch {
         if (!cancelled && Date.now() >= hideGuardUntilRef.current && !menuOpen) {
-          setTitleBarVisible(false);
+          show(false);
         }
       } finally {
         pollInFlight = false;
       }
     };
 
+    // 폴링 주기를 상황에 맞춘다. 타이틀바가 떠 있거나 드래그 보호 구간이면
+    // "언제 나가는지"를 봐야 하므로 75ms, 커서가 밖에 있으면 아무것도 바뀔 수
+    // 없으므로 1초로 늦춘다. 고정 75ms였을 때는 유휴 상태에서도 초당 13회
+    // IPC가 돌아 WebView2 파이프 트래픽의 97%를 혼자 만들어냈다.
+    const IDLE_MS = 1000;
+    const ACTIVE_MS = 75;
+    let timer: number | undefined;
+    const nextDelay = () =>
+      titleBarVisibleRef.current || Date.now() < hideGuardUntilRef.current
+        ? ACTIVE_MS
+        : IDLE_MS;
+    const schedule = () => {
+      if (cancelled) return;
+      timer = window.setTimeout(tick, nextDelay());
+    };
+    const tick = async () => {
+      await syncTitleBarVisibility();
+      schedule();
+    };
+
+    // 커서가 들어오는 순간은 DOM 이벤트로 즉시 잡는다 — 유휴 폴링이 1초라도
+    // 타이틀바가 늦게 뜨지 않도록. 이벤트는 웹뷰 안에서 처리되므로 IPC가 없다.
+    const wake = () => {
+      if (cancelled || titleBarVisibleRef.current) return;
+      show(true);
+      // 다음 폴링이 실제 커서 위치로 판정을 정정한다(창 밖으로 나갔으면 곧 숨김).
+      if (timer !== undefined) window.clearTimeout(timer);
+      schedule();
+    };
+    document.addEventListener("mouseenter", wake, true);
+    document.addEventListener("mousemove", wake, true);
+
     // 이벤트 payload를 그대로 쓰지 않고 다시 질의한다 — onResized는 inner size를
     // 주는데 여기 비교는 outer size 기준이라 값이 어긋난다.
     const unlistenMoved = currentWindow.onMoved(() => { void refreshRect(); });
     const unlistenResized = currentWindow.onResized(() => { void refreshRect(); });
 
-    void refreshRect().then(syncTitleBarVisibility);
-    const id = window.setInterval(syncTitleBarVisibility, 75);
+    void refreshRect().then(tick);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("mouseenter", wake, true);
+      document.removeEventListener("mousemove", wake, true);
       unlistenMoved.then((u) => u());
       unlistenResized.then((u) => u());
     };
