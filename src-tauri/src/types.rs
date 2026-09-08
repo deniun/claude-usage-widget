@@ -62,7 +62,7 @@ pub struct UsageResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRect {
     pub x: i32,
     pub y: i32,
@@ -82,7 +82,7 @@ impl Default for ViewMode {
     fn default() -> Self { ViewMode::Normal }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub window: WindowRect,
     #[serde(rename = "alwaysOnTop")]

@@ -76,17 +76,34 @@ export default function App() {
     const currentWindow = getCurrentWindow();
     let cancelled = false;
     let pollInFlight = false;
+    // 창 사각형은 Moved/Resized 때만 바뀌므로 캐시해 두고, 75ms 폴링은 커서
+    // 좌표 하나만 물어본다. 예전엔 매 틱마다 cursorPosition/outerPosition/
+    // outerSize 세 번을 IPC로 왕복해서(초당 40회) 유휴 상태에서도 WebView2
+    // 파이프 트래픽이 계속 발생했다.
+    let rect: { x: number; y: number; width: number; height: number } | null = null;
+
+    const refreshRect = async () => {
+      try {
+        const [position, size] = await Promise.all([
+          currentWindow.outerPosition(),
+          currentWindow.outerSize(),
+        ]);
+        if (cancelled) return;
+        rect = { x: position.x, y: position.y, width: size.width, height: size.height };
+      } catch {
+        rect = null;
+      }
+    };
 
     const syncTitleBarVisibility = async () => {
       if (pollInFlight) return;
       pollInFlight = true;
       try {
-        const [cursor, position, size] = await Promise.all([
-          cursorPosition(),
-          currentWindow.outerPosition(),
-          currentWindow.outerSize(),
-        ]);
-        if (cancelled) return;
+        if (!rect) await refreshRect();
+        const cursor = await cursorPosition();
+        if (cancelled || !rect) return;
+        const position = rect;
+        const size = rect;
         const hovered =
           cursor.x >= position.x &&
           cursor.x < position.x + size.width &&
@@ -106,11 +123,18 @@ export default function App() {
       }
     };
 
-    syncTitleBarVisibility();
+    // 이벤트 payload를 그대로 쓰지 않고 다시 질의한다 — onResized는 inner size를
+    // 주는데 여기 비교는 outer size 기준이라 값이 어긋난다.
+    const unlistenMoved = currentWindow.onMoved(() => { void refreshRect(); });
+    const unlistenResized = currentWindow.onResized(() => { void refreshRect(); });
+
+    void refreshRect().then(syncTitleBarVisibility);
     const id = window.setInterval(syncTitleBarVisibility, 75);
     return () => {
       cancelled = true;
       window.clearInterval(id);
+      unlistenMoved.then((u) => u());
+      unlistenResized.then((u) => u());
     };
   }, [menuOpen]);
 
