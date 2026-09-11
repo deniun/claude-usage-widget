@@ -86,15 +86,58 @@ fn push_window(out: &mut Vec<UsageWindow>, key: &str, label: &str, pw: &PrimaryO
     });
 }
 
+/// 24시간 미만이면 "짧은 창"(5시간 같은 세션 한도)으로 본다.
+const SHORT_WINDOW_MAX_MINS: u64 = 24 * 60;
+
+fn short_window(slot: &Option<PrimaryOrSecondary>) -> Option<&PrimaryOrSecondary> {
+    let w = slot.as_ref()?;
+    match w.window_duration_mins {
+        Some(d) if d < SHORT_WINDOW_MAX_MINS => Some(w),
+        _ => None,
+    }
+}
+
 pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
     let mut windows = Vec::new();
-    let buckets: Vec<&Bucket> = result.rate_limits_by_limit_id.get("codex").into_iter().collect();
-    for b in buckets {
+    let codex_bucket = result.rate_limits_by_limit_id.get("codex");
+    if let Some(b) = codex_bucket {
         let base = b.limit_id.clone().unwrap_or_else(|| "unknown".into());
         let label = bucket_label(b);
         if let Some(p) = &b.primary { push_window(&mut windows, &format!("{}_primary", base), &label, p); }
         if let Some(s) = &b.secondary { push_window(&mut windows, &format!("{}_secondary", base), &label, s); }
     }
+
+    // 플랜에 따라 `codex` 버킷이 주간 창만 준다(예: planType=prolite → primary가
+    // 10080분 하나뿐이고 secondary는 null). 그런 계정에서 5시간 창은 모델별
+    // 버킷에만 존재하므로 위젯에 세션 한도가 통째로 안 보였다.
+    // `codex` 버킷에 짧은 창이 하나도 없을 때만 모델별 버킷에서 가장 짧은 창
+    // 하나를 보충한다. 모델별 주간 창은 `codex` 주간과 중복이라 계속 감춘다.
+    let has_short_window = codex_bucket.is_some_and(|b| {
+        short_window(&b.primary).is_some() || short_window(&b.secondary).is_some()
+    });
+    if !has_short_window {
+        let mut candidates: Vec<(u64, &String, &Bucket, &PrimaryOrSecondary)> = Vec::new();
+        for (id, b) in &result.rate_limits_by_limit_id {
+            if id == "codex" || id == "base_model_inference" {
+                continue;
+            }
+            for slot in [&b.primary, &b.secondary] {
+                if let Some(w) = short_window(slot) {
+                    candidates.push((w.window_duration_mins.unwrap_or(u64::MAX), id, b, w));
+                }
+            }
+        }
+        // HashMap 순회 순서는 비결정적이다. 기간 → 버킷 id 순으로 고정한다.
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        if let Some((_, id, bucket, w)) = candidates.first() {
+            let label = bucket_label(bucket);
+            let mut short = Vec::new();
+            push_window(&mut short, &format!("codex_short_{}", id), &label, w);
+            // 짧은 창이 위에 오게 한다(5시간 → 7일).
+            windows.splice(0..0, short);
+        }
+    }
+
     UsageResponse {
         provider: Provider::Codex,
         status: Status::Ok,
@@ -109,10 +152,14 @@ pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
 pub(crate) fn normalize_cached_response(response: &mut UsageResponse) {
     response.windows.retain(|w| {
         matches!(w.key.as_str(), "codex_primary" | "codex_secondary")
+            || w.key.starts_with("codex_short_")
     });
     for window in &mut response.windows {
-        let duration = window.name.split(" (").next().unwrap_or(&window.name);
-        window.name = format!("{} (Codex 전체)", duration);
+        // 보충된 짧은 창은 모델 이름(예: "5시간 (Spark)")을 그대로 둔다.
+        if matches!(window.key.as_str(), "codex_primary" | "codex_secondary") {
+            let duration = window.name.split(" (").next().unwrap_or(&window.name);
+            window.name = format!("{} (Codex 전체)", duration);
+        }
     }
 }
 
@@ -239,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_model_specific_and_reserve_limits() {
+    fn supplements_short_window_from_model_bucket_when_codex_has_none() {
         fn weekly_bucket(id: &str, used_percent: f64) -> Bucket {
             Bucket {
                 limit_id: Some(id.into()),
@@ -280,9 +327,87 @@ mod tests {
         let result = RateLimitsResult { rate_limits_by_limit_id: map };
         let resp = map_to_response(&result);
 
-        assert_eq!(resp.windows.len(), 1);
-        assert_eq!(resp.windows[0].name, "7일 (Codex 전체)");
+        // `codex` 버킷에 5시간 창이 없으므로 모델별 버킷에서 하나만 보충한다.
+        // 모델별 주간 창과 "GPT 예비"(base_model_inference)는 계속 감춘다.
+        assert_eq!(resp.windows.len(), 2);
+        assert_eq!(resp.windows[0].name, "5시간 (Spark)");
+        assert_eq!(resp.windows[0].key, "codex_short_codex_bengalfox");
+        assert_eq!(resp.windows[1].name, "7일 (Codex 전체)");
+        assert_eq!(resp.windows[1].key, "codex_primary");
+    }
+
+    /// `codex` 버킷이 이미 5시간 창을 주면 모델별 버킷은 건드리지 않는다.
+    #[test]
+    fn does_not_supplement_when_codex_bucket_has_short_window() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "codex".to_string(),
+            Bucket {
+                limit_id: Some("codex".into()),
+                limit_name: None,
+                primary: Some(PrimaryOrSecondary {
+                    used_percent: Some(20.0),
+                    window_duration_mins: Some(300),
+                    resets_at: Some(4_000_000_000),
+                }),
+                secondary: Some(PrimaryOrSecondary {
+                    used_percent: Some(55.0),
+                    window_duration_mins: Some(10_080),
+                    resets_at: Some(4_000_000_000),
+                }),
+            },
+        );
+        map.insert(
+            "codex_bengalfox".into(),
+            Bucket {
+                limit_id: Some("codex_bengalfox".into()),
+                limit_name: Some("GPT-5.3-Codex-Spark".into()),
+                primary: Some(PrimaryOrSecondary {
+                    used_percent: Some(0.0),
+                    window_duration_mins: Some(300),
+                    resets_at: Some(4_000_000_000),
+                }),
+                secondary: None,
+            },
+        );
+
+        let resp = map_to_response(&RateLimitsResult { rate_limits_by_limit_id: map });
+        assert_eq!(resp.windows.len(), 2);
         assert_eq!(resp.windows[0].key, "codex_primary");
+        assert_eq!(resp.windows[1].key, "codex_secondary");
+    }
+
+    /// 보충된 짧은 창은 캐시 정규화에서 살아남고 모델 이름도 유지한다.
+    #[test]
+    fn normalize_keeps_supplemented_short_window() {
+        let mut response = UsageResponse {
+            provider: Provider::Codex,
+            status: Status::Ok,
+            windows: vec![
+                UsageWindow {
+                    key: "codex_short_codex_bengalfox".into(),
+                    name: "5시간 (Spark)".into(),
+                    utilization: 0.0,
+                    resets_at: "2030-01-01T00:00:00Z".into(),
+                    time_progress: 1.0,
+                },
+                UsageWindow {
+                    key: "codex_primary".into(),
+                    name: "7일".into(),
+                    utilization: 50.0,
+                    resets_at: "2030-01-01T00:00:00Z".into(),
+                    time_progress: 43.0,
+                },
+            ],
+            extra_usage: None,
+            error: None,
+        };
+
+        normalize_cached_response(&mut response);
+
+        assert_eq!(response.windows.len(), 2);
+        assert_eq!(response.windows[0].name, "5시간 (Spark)");
+        assert_eq!(response.windows[1].name, "7일 (Codex 전체)");
     }
 
     #[test]
