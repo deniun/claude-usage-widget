@@ -49,13 +49,24 @@ pub(crate) struct RawLimit {
 /// 추가 사용(extra usage) 원본. 금액은 **최소 화폐 단위 정수**로 온다
 /// (USD면 센트: `used_credits: 14306` = $143.06). `decimal_places`로 나눠야 실제 금액이다.
 /// 필드가 하나라도 빠져도 전체 파싱이 죽지 않도록 전부 `default`.
+/// `#[serde(default)]`는 **필드 누락**만 처리한다. 명시적 `null`이 오면
+/// `invalid type: null, expected f64`로 전체 파싱이 죽는다.
+/// 크레딧(extra usage)을 꺼 두면 API가 이 필드들을 `null`로 보낸다.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize, Default)]
 pub(crate) struct RawExtraUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub is_enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub monthly_limit: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub used_credits: f64,
     #[serde(default)]
     pub utilization: Option<f64>,
@@ -282,7 +293,15 @@ pub async fn fetch() -> AppResult<UsageResponse> {
                     preview
                 ),
             );
-            Err(AppError::Expired)
+            // 본문이 JSON으로 파싱조차 안 되면(로그인 HTML 등) 만료로 본다.
+            // JSON은 맞는데 스키마가 어긋난 것이면 만료가 아니다 —
+            // Expired로 돌리면 "토큰 만료 → CLI 갱신 → 파일 안 바뀜 → 수동 로그인"
+            // 루프에 갇혀 원인을 영영 못 본다.
+            if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                Err(AppError::Json(e))
+            } else {
+                Err(AppError::Expired)
+            }
         }
     }
 }
@@ -524,6 +543,36 @@ mod tests {
         let extra = map_raw_to_response(&raw).extra_usage.unwrap();
         assert_eq!(extra.used_credits, 2.5);
         assert_eq!(extra.monthly_limit, 50.0);
+    }
+
+    #[test]
+    /// 회귀: 크레딧을 꺼 두면 API가 금액 필드를 명시적 `null`로 보낸다.
+    /// `#[serde(default)]`만으로는 못 막고 응답 전체가 파싱 실패했다
+    /// (`invalid type: null, expected f64`) → 위젯이 "토큰 만료"로 오표시.
+    #[test]
+    fn extra_usage_explicit_nulls_do_not_break_parsing() {
+        let raw: RawUsage = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": 3.0, "resets_at": "2026-09-11T06:30:00+00:00"},
+                "seven_day": {"utilization": 86.0, "resets_at": "2026-09-13T13:00:00+00:00"},
+                "extra_usage": {
+                    "is_enabled": false,
+                    "monthly_limit": null,
+                    "used_credits": null,
+                    "utilization": null,
+                    "currency": null,
+                    "decimal_places": null,
+                    "disabled_reason": null,
+                    "user_disabled": true
+                }
+            }"#,
+        )
+        .expect("explicit nulls must parse");
+        let extra = raw.extra_usage.as_ref().expect("extra_usage present");
+        assert!(!extra.is_enabled);
+        assert_eq!(extra.monthly_limit, 0.0);
+        assert_eq!(extra.used_credits, 0.0);
+        assert!(extra.utilization.is_none());
     }
 
     #[test]
